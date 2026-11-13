@@ -1,9 +1,11 @@
 """Unit tests for sky.jobs.utils functions."""
+import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 from unittest.mock import MagicMock
 
+import psutil
 import pytest
 
 from sky import exceptions
@@ -866,7 +868,7 @@ class TestControllerProcessAlive:
         """Process considered dead when start time does not match."""
         expected_pid = 5678
         recorded_start = 1700000000.0
-        actual_start = recorded_start + 5.0
+        actual_start = recorded_start + 5.37
 
         class _FakeProcess:
 
@@ -887,6 +889,56 @@ class TestControllerProcessAlive:
             pid=expected_pid, started_at=recorded_start)
         assert (jobs_utils.controller_process_alive(record, legacy_job_id=42) is
                 False)
+
+    @pytest.mark.parametrize('shift', [190.0, -3600.0])
+    def test_controller_process_alive_after_wall_clock_step(
+            self, monkeypatch, shift):
+        """A wall clock step moves the boot time, not the process."""
+        expected_pid = 1357
+        # psutil on Linux: start offset since boot (clock ticks) + btime.
+        recorded_start = 1794523236.0 + 190.59
+
+        class _FakeProcess:
+
+            def __init__(self, pid):
+                assert pid == expected_pid
+
+            def create_time(self):
+                return recorded_start + shift
+
+            def cmdline(self):
+                return ['python', '-m', 'sky.jobs.controller']
+
+            def is_running(self):
+                return True
+
+        monkeypatch.setattr(jobs_utils.psutil, 'Process', _FakeProcess)
+        record = managed_job_state.ControllerPidRecord(
+            pid=expected_pid, started_at=recorded_start)
+        assert jobs_utils.controller_process_alive(record, legacy_job_id=42)
+
+        class _OtherProcess(_FakeProcess):
+
+            def cmdline(self):
+                return ['python', '-m', 'some.other.module']
+
+        monkeypatch.setattr(jobs_utils.psutil, 'Process', _OtherProcess)
+        assert (jobs_utils.controller_process_alive(record, legacy_job_id=42) is
+                False)
+
+    @pytest.mark.skipif(not psutil.LINUX, reason='btime is Linux only')
+    def test_controller_process_alive_real_boot_time_shift(self, monkeypatch):
+        """Same as above against a real process and psutil's own math."""
+        pid = os.getpid()
+        record = managed_job_state.ControllerPidRecord(
+            pid=pid, started_at=psutil.Process(pid).create_time())
+        real_boot_time = psutil.boot_time()
+        monkeypatch.setattr('psutil._pslinux.boot_time',
+                            lambda: real_boot_time + 72)
+        monkeypatch.setattr(
+            jobs_utils.psutil.Process, 'cmdline',
+            lambda self: ['python', '-m', 'sky.jobs.controller'])
+        assert jobs_utils.controller_process_alive(record)
 
     def test_controller_process_alive_fallback_requires_keyword(
             self, monkeypatch):

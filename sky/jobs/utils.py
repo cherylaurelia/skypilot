@@ -858,6 +858,28 @@ async def get_job_status(
         return None, potential_transient_error_reason
 
 
+def _same_start_time(process: 'psutil.Process', started_at: float) -> bool:
+    """Whether process started at started_at, allowing for wall clock steps.
+
+    On Linux, psutil's create_time() is the start offset since boot (in clock
+    ticks) plus the boot time from /proc/stat, which is whole seconds and moves
+    whenever the wall clock is stepped (NTP step, VM resume). A step therefore
+    shifts create_time() by whole seconds for a process that is still the same
+    one. The tick part is in 1/CLK_TCK s (usually 10 ms) steps, so a process
+    that reused the pid matches it only by chance; require that and the
+    controller cmdline before accepting a shift.
+    """
+    create_time = process.create_time()
+    if create_time == started_at:
+        return True
+    shift = create_time - started_at
+    if abs(shift - round(shift)) > 1e-3:
+        return False
+    cmd_str = ' '.join(process.cmdline())
+    return ('-m sky.jobs.controller' in cmd_str or
+            '-msky.jobs.controller' in cmd_str)
+
+
 def controller_process_alive(record: managed_job_state.ControllerPidRecord,
                              legacy_job_id: Optional[int] = None,
                              quiet: bool = True) -> bool:
@@ -871,7 +893,7 @@ def controller_process_alive(record: managed_job_state.ControllerPidRecord,
         process = psutil.Process(record.pid)
 
         if record.started_at is not None:
-            if process.create_time() != record.started_at:
+            if not _same_start_time(process, record.started_at):
                 if not quiet:
                     logger.debug(f'Controller process {record.pid} has started '
                                  f'at {record.started_at} but process has '
